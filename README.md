@@ -260,7 +260,7 @@ agent --print --output-format stream-json --stream-partial-output \
 
 The prompt is written to **stdin** (not argv) so long sessions do not hit Linux `MAX_ARG_STRLEN` / `E2BIG`. The CLI's NDJSON stdout is read line-by-line; streaming `assistant` deltas are mapped to Pi `text_*` events, and `tool_call` events become `thinking_*` traces. Duplicate buffered flushes (`model_call_id` / final flush without `timestamp_ms`) are skipped; growing text snapshots are converted to suffixes.
 
-- **Multi-turn context**: The full message history is serialised as a prefixed transcript (`[User] / [Assistant] / [Tool result]`) and sent as a single prompt. Cursor manages its own internal conversation from that point.
+- **Multi-turn context**: The first request serialises the full Pi history as a prefixed transcript (`[User] / [Assistant] / [Tool result]`). Later requests resume the returned Cursor chat with `--resume <session_id>` and send only the latest user message. The chat ID is stored with its workspace in the Pi session and is discarded after compaction, tree navigation, forking, or a workspace mismatch. If resume fails before producing text, the provider rebuilds the chat once from the full Pi context.
 - **Safety defaults**: writes and MCP auto-approval are disabled. Set `CURSOR_AGENT_FORCE=1` to allow writes, and `CURSOR_AGENT_TRUST=1` to trust the workspace and approve MCP tools.
 - **Token usage**: Cursor CLI does not expose token counts; usage is reported as 0.
 - **Cost tracking**: Models are registered with `cost: 0` since billing goes through your Cursor subscription.
@@ -390,7 +390,7 @@ Models are registered with `input: ["text", "image"]`. Temp files are deleted wh
 
 ## Limitations
 
-- Multi-turn history is serialised as plain text; very long conversations may exceed the model's context window.
+- The initial history is serialised as plain text, so existing structured tool calls and thinking blocks are not preserved when starting or rebuilding a Cursor chat.
 - Token usage is always reported as 0 (the Cursor CLI does not expose token counts).
 
 ---
