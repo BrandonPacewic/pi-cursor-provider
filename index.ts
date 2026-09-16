@@ -537,6 +537,17 @@ async function serializeContext(
   return prompt;
 }
 
+async function serializeLatestUserMessage(
+  context: Context,
+  state: PromptTempFiles,
+): Promise<string> {
+  const message = context.messages.findLast((msg) => msg.role === "user");
+  if (!message) return serializeContext(context, state);
+  return typeof message.content === "string"
+    ? message.content
+    : serializeContentBlocks(message.content, state);
+}
+
 // ---------------------------------------------------------------------------
 // NDJSON event types — Cursor CLI stream-json shape
 // ---------------------------------------------------------------------------
@@ -573,6 +584,13 @@ interface CursorResultEvent {
   type: "result";
   subtype: string;
   duration_ms: number;
+  session_id?: string;
+}
+
+interface CursorSessionState {
+  chatId?: string;
+  workspace?: string;
+  dirty: boolean;
 }
 
 type CursorStreamEvent =
@@ -690,7 +708,9 @@ function assistantTextDelta(previous: string, incoming: string): string {
 function streamCursorCli(
   model: Model<Api>,
   context: Context,
-  options?: SimpleStreamOptions,
+  options: SimpleStreamOptions | undefined,
+  session: CursorSessionState,
+  allowResumeFallback = true,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -731,7 +751,9 @@ function streamCursorCli(
         "agent";
 
       const workspacePath = process.cwd();
-      const prompt = await serializeContext(context, promptTempFiles);
+      const prompt = session.chatId
+        ? await serializeLatestUserMessage(context, promptTempFiles)
+        : await serializeContext(context, promptTempFiles);
       const reasoningLevel = (options as { reasoning?: string })?.reasoning;
       const cliModelId = toCursorId(model.id, reasoningLevel);
 
@@ -745,6 +767,8 @@ function streamCursorCli(
         "--workspace",
         workspacePath,
       ];
+
+      if (session.chatId) args.push("--resume", session.chatId);
 
       if (process.env["CURSOR_AGENT_TRUST"] === "1") {
         args.push("--trust", "--approve-mcps");
@@ -777,6 +801,8 @@ function streamCursorCli(
       let thinkingBlockOpen = false;
       let currentBlockText = "";
       let segmentText = "";
+      let responseSessionId: string | undefined;
+      let malformedLines = 0;
 
       const closeTextBlock = () => {
         if (!textBlockOpen) return;
@@ -865,10 +891,14 @@ function streamCursorCli(
 
       rl.on("line", (line: string) => {
         const event = parseLine(line);
-        if (!event) return;
+        if (!event) {
+          if (line.trim()) malformedLines += 1;
+          return;
+        }
 
         if (event.type === "assistant") {
           const ae = event as CursorAssistantEvent;
+          responseSessionId = ae.session_id || responseSessionId;
           if (!isNewAssistantDelta(ae)) return;
           for (const block of ae.message.content) {
             if (block.type !== "text") continue;
@@ -877,6 +907,12 @@ function streamCursorCli(
             segmentText += delta;
             appendText(delta);
           }
+          return;
+        }
+
+        if (event.type === "result") {
+          responseSessionId =
+            (event as CursorResultEvent).session_id || responseSessionId;
           return;
         }
 
@@ -902,7 +938,10 @@ function streamCursorCli(
       });
 
       await new Promise<void>((resolve) => {
-        child.on("close", (code) => {
+        let settled = false;
+        child.on("close", async (code) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeout);
           options?.signal?.removeEventListener("abort", onAbort);
 
@@ -918,6 +957,31 @@ function streamCursorCli(
           }
 
           if (code !== 0 || timedOut) {
+            if (
+              session.chatId &&
+              allowResumeFallback &&
+              !timedOut &&
+              !output.content.some(
+                (block) => block.type === "text" && block.text.length > 0,
+              )
+            ) {
+              session.chatId = undefined;
+              session.workspace = undefined;
+              session.dirty = true;
+              const retry = streamCursorCli(
+                model,
+                context,
+                options,
+                session,
+                false,
+              );
+              for await (const event of retry) {
+                if (event.type !== "start") stream.push(event);
+              }
+              stream.end();
+              resolve();
+              return;
+            }
             output.stopReason = "error";
             output.errorMessage = timedOut
               ? `Cursor CLI timed out after ${timeoutMs}ms`
@@ -929,6 +993,27 @@ function streamCursorCli(
             return;
           }
 
+          if (
+            !output.content.some(
+              (block) => block.type === "text" && block.text.length > 0,
+            )
+          ) {
+            output.stopReason = "error";
+            output.errorMessage = malformedLines
+              ? `Cursor CLI produced no assistant output (${malformedLines} malformed stream lines)`
+              : "Cursor CLI produced no assistant output";
+            setTiming();
+            stream.push({ type: "error", reason: "error", error: output });
+            stream.end();
+            resolve();
+            return;
+          }
+
+          if (responseSessionId && responseSessionId !== session.chatId) {
+            session.chatId = responseSessionId;
+            session.workspace = workspacePath;
+            session.dirty = true;
+          }
           setTiming();
           stream.push({ type: "done", reason: "stop", message: output });
           stream.end();
@@ -936,6 +1021,8 @@ function streamCursorCli(
         });
 
         child.on("error", (err) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeout);
           options?.signal?.removeEventListener("abort", onAbort);
           output.stopReason = "error";
@@ -1053,6 +1140,12 @@ export default async function (pi: ExtensionAPI) {
   const agentPath =
     process.env["CURSOR_AGENT_PATH"] ?? process.env["AGENT_PATH"] ?? "agent";
   let permissionsPrompted = false;
+  const cursorSession: CursorSessionState = { dirty: false };
+  const resetCursorSession = () => {
+    cursorSession.chatId = undefined;
+    cursorSession.workspace = undefined;
+    cursorSession.dirty = true;
+  };
 
   const promptPermissions = async (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
@@ -1107,10 +1200,34 @@ export default async function (pi: ExtensionAPI) {
     },
     api: "cursor-cli" as Api,
     models: toProviderModels(modelDefs),
-    streamSimple: streamCursorCli,
+    streamSimple: (model, context, options) =>
+      streamCursorCli(model, context, options, cursorSession),
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    cursorSession.chatId = undefined;
+    cursorSession.workspace = undefined;
+    cursorSession.dirty = false;
+    const reason = (event as { reason?: string }).reason;
+    if (reason !== "new" && reason !== "fork") {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type === "custom" && entry.customType === "cursor-session") {
+          const data = entry.data as
+            | { chatId?: unknown; workspace?: unknown }
+            | undefined;
+          if (
+            typeof data?.chatId === "string" &&
+            data.workspace === ctx.cwd
+          ) {
+            cursorSession.chatId = data.chatId;
+            cursorSession.workspace = ctx.cwd;
+          } else {
+            cursorSession.chatId = undefined;
+            cursorSession.workspace = undefined;
+          }
+        }
+      }
+    }
     if (
       ctx.model?.provider === "cursor" &&
       process.env["CURSOR_AGENT_TRUST"] !== "1" &&
@@ -1118,6 +1235,18 @@ export default async function (pi: ExtensionAPI) {
     )
       await promptPermissions(ctx);
   });
+
+  pi.on("turn_end", () => {
+    if (!cursorSession.dirty) return;
+    pi.appendEntry("cursor-session", {
+      chatId: cursorSession.chatId ?? null,
+      workspace: cursorSession.workspace ?? null,
+    });
+    cursorSession.dirty = false;
+  });
+
+  pi.on("session_compact", resetCursorSession);
+  pi.on("session_tree", resetCursorSession);
 
   pi.on("model_select", async (event, ctx) => {
     if (

@@ -260,7 +260,7 @@ agent --print --output-format stream-json --stream-partial-output \
 
 提示词写入 **stdin**（而非 argv），因此长会话不会触及 Linux 的 `MAX_ARG_STRLEN` / `E2BIG` 限制。CLI 的 NDJSON 标准输出会被逐行读取；流式 `assistant` 增量映射为 Pi 的 `text_*` 事件，`tool_call` 事件则成为 `thinking_*` 跟踪。重复的缓冲区刷新（`model_call_id` / 不含 `timestamp_ms` 的最终刷新）会被跳过；不断增长的文本快照会转换为后缀增量。
 
-- **多轮上下文**：完整消息历史会序列化为带前缀的对话记录（`[User] / [Assistant] / [Tool result]`），并作为单个提示词发送。之后由 Cursor 管理其内部对话。
+- **多轮上下文**：首次请求会把完整 Pi 历史序列化为带前缀的对话记录（`[User] / [Assistant] / [Tool result]`）。后续请求通过 `--resume <session_id>` 恢复 Cursor 对话，仅发送最新用户消息。对话 ID 会和工作区一起保存在 Pi 会话中；压缩、树导航、分叉或工作区不匹配时会丢弃。如果恢复在产生文本前失败，插件会用完整 Pi 上下文自动重建一次对话。
 - **安全默认值**：默认禁用写入和 MCP 自动批准。设置 `CURSOR_AGENT_FORCE=1` 以允许写入，设置 `CURSOR_AGENT_TRUST=1` 以信任工作区并批准 MCP 工具。
 - **令牌用量**：Cursor CLI 不公开令牌数量；用量报告为 0。
 - **成本跟踪**：模型注册时使用 `cost: 0`，因为计费通过你的 Cursor 订阅进行。
@@ -390,7 +390,7 @@ Cursor Agent CLI 从提示词中的文件路径读取图像。当 Pi 消息包�
 
 ## 限制
 
-- 多轮历史记录会序列化为纯文本；非常长的对话可能超出模型的上下文窗口。
+- 首次创建或重建 Cursor 对话时，历史会序列化为纯文本，因此已有的结构化工具调用和思考块不会被保留。
 - 令牌用量始终报告为 0（Cursor CLI 不公开令牌数量）。
 
 ---

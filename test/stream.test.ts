@@ -26,9 +26,11 @@ if (process.argv.includes("models")) {
   process.stdin.on("end", () => {
     writeFileSync(process.env.ARGS_FILE, JSON.stringify(process.argv.slice(2)));
     writeFileSync(process.env.PROMPT_FILE, prompt);
-    console.log(JSON.stringify({ type: "assistant", timestamp_ms: 1, message: { role: "assistant", content: [{ type: "text", text: "partial" }] } }));
+    const resumeFailed = process.env.TEST_RESUME_FAIL && process.argv.includes("--resume");
+    if (process.env.TEST_MALFORMED) console.log("not-json");
+    else if (!process.env.TEST_EMPTY && !resumeFailed) console.log(JSON.stringify({ type: "assistant", session_id: "chat-1", timestamp_ms: 1, message: { role: "assistant", content: [{ type: "text", text: "partial" }] } }));
     if (process.env.TEST_HANG) setInterval(() => {}, 1_000);
-    else process.exitCode = 1;
+    else process.exitCode = process.env.TEST_SUCCESS && !resumeFailed ? 0 : 1;
   });
 }
 `;
@@ -36,6 +38,7 @@ if (process.argv.includes("models")) {
 async function run(
   flags: Record<string, string | undefined> = {},
   context: unknown = { messages: [] },
+  nextContext?: unknown,
 ) {
   const dir = await mkdtemp(join(tmpdir(), "pi-cursor-provider-test-"));
   const agentPath = join(dir, "agent.mjs");
@@ -71,14 +74,23 @@ async function run(
     on: () => {},
   } as unknown as ExtensionAPI);
   assert.ok(provider?.streamSimple);
-  const stream = provider.streamSimple(
-    { api: "cursor-cli", provider: "cursor", id: "auto" } as Parameters<
-      typeof provider.streamSimple
-    >[0],
-    context as Parameters<typeof provider.streamSimple>[1],
-  );
-  const events = [];
-  for await (const event of stream) events.push(event);
+  const streamSimple = provider.streamSimple;
+  const model = {
+    api: "cursor-cli",
+    provider: "cursor",
+    id: "auto",
+  } as Parameters<typeof provider.streamSimple>[0];
+  const collect = async (value: unknown) => {
+    const events = [];
+    const stream = streamSimple(
+      model,
+      value as Parameters<typeof streamSimple>[1],
+    );
+    for await (const event of stream) events.push(event);
+    return events;
+  };
+  let events = await collect(context);
+  if (nextContext) events = await collect(nextContext);
 
   const args = JSON.parse(await readFile(argsPath, "utf8"));
   const prompt = await readFile(promptPath, "utf8");
@@ -133,6 +145,66 @@ test("inline images are removed after the CLI finishes", async () => {
   const path = prompt.match(/\/tmp\/pi-cursor-provider-[^\s]+/u)?.[0];
   assert.ok(path);
   await assert.rejects(access(path));
+});
+
+test("successful turns resume the Cursor chat with only the latest user message", async () => {
+  const { args, prompt } = await run(
+    { TEST_SUCCESS: "1" },
+    { messages: [{ role: "user", content: "first" }] },
+    {
+      messages: [
+        { role: "user", content: "first" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "partial" }],
+        },
+        { role: "user", content: "second" },
+      ],
+    },
+  );
+  assert.deepEqual(args.slice(-2), ["--resume", "chat-1"]);
+  assert.equal(prompt, "second");
+});
+
+test("a failed resume retries once with the full Pi context", async () => {
+  const { args, events, prompt } = await run(
+    { TEST_SUCCESS: "1", TEST_RESUME_FAIL: "1" },
+    { messages: [{ role: "user", content: "first" }] },
+    {
+      messages: [
+        { role: "user", content: "first" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "partial" }],
+        },
+        { role: "user", content: "second" },
+      ],
+    },
+  );
+  assert.equal(args.includes("--resume"), false);
+  assert.match(prompt, /\[User\]\nfirst/);
+  assert.match(prompt, /\[User\]\nsecond/);
+  assert.equal(events.at(-1)?.type, "done");
+});
+
+test("successful empty output is reported as an error", async () => {
+  const { events } = await run({ TEST_SUCCESS: "1", TEST_EMPTY: "1" });
+  const last = events.at(-1);
+  assert.equal(last?.type, "error");
+  assert.match(
+    last?.type === "error" ? last.error.errorMessage ?? "" : "",
+    /no assistant output/,
+  );
+});
+
+test("malformed output is reported as a protocol error", async () => {
+  const { events } = await run({ TEST_SUCCESS: "1", TEST_MALFORMED: "1" });
+  const last = events.at(-1);
+  assert.equal(last?.type, "error");
+  assert.match(
+    last?.type === "error" ? last.error.errorMessage ?? "" : "",
+    /malformed stream lines/,
+  );
 });
 
 test("explicit flags enable write and trust", async () => {
