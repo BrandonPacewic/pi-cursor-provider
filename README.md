@@ -199,7 +199,7 @@ To see the models currently available to your account:
 agent models
 ```
 
-Models with thinking or multiple effort variants are marked as reasoning models in Pi. The CLI does not expose token limits, so unknown models use conservative 200k / 32k defaults.
+Models with thinking or multiple effort variants are marked as reasoning models in Pi. When Cursor reports `xhigh` or `max` variants, those levels are exposed in Pi's thinking picker; unsupported levels remain hidden. The CLI does not expose token limits, so unknown models use conservative 200k / 32k defaults.
 
 Old ids such as `claude-sonnet-4-6` or `sonnet-4.6` still resolve to the current family.
 

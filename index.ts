@@ -60,7 +60,7 @@ interface ParsedCursorModelId {
   fast: boolean;
 }
 
-type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 const EFFORT_SUFFIXES = [
   "extra-high",
@@ -177,12 +177,18 @@ function reasoningToEffort(level?: string): string | undefined {
       return "high";
     case "xhigh":
       return "xhigh";
+    case "max":
+      return "max";
     default:
       return undefined;
   }
 }
 
-function pickVariant(family: string, reasoning?: string): string {
+function pickVariant(
+  family: string,
+  reasoning?: string,
+  preferProviderDefault = false,
+): string {
   const defs = familyVariants.get(family) ?? [];
   const wantThinking = Boolean(reasoning);
   const wantEffort = reasoningToEffort(reasoning);
@@ -191,6 +197,17 @@ function pickVariant(family: string, reasoning?: string): string {
   if (defs.length === 0) {
     if (wantEffort) return `${family}[effort=${wantEffort}]`;
     return family;
+  }
+
+  // Pi represents its "off" setting by omitting options.reasoning. When the
+  // Cursor catalog offers a no-reasoning variant, prefer it for actual turns.
+  // Registration still uses the provider default for the family label.
+  if (!reasoning && !preferProviderDefault) {
+    const noneVariant = defs.find((def) => {
+      const parsed = parseCursorModelId(def.id);
+      return !parsed.fast && parsed.effort === "none";
+    });
+    if (noneVariant) return noneVariant.id;
   }
 
   let bestId = defs[0].id;
@@ -281,6 +298,24 @@ function indexModelDefs(defs: CursorModelDef[]): void {
     list.push(def);
     familyVariants.set(family, list);
   }
+}
+
+function thinkingLevelMapFor(
+  variants: CursorModelDef[],
+): { xhigh?: string; max?: string } | undefined {
+  const efforts = new Set(
+    variants.map((variant) => parseCursorModelId(variant.id).effort),
+  );
+  const thinkingLevelMap: { xhigh?: string; max?: string } = {};
+
+  if (efforts.has("xhigh") || efforts.has("extra-high")) {
+    thinkingLevelMap.xhigh = "xhigh";
+  }
+  if (efforts.has("max")) thinkingLevelMap.max = "max";
+
+  return Object.keys(thinkingLevelMap).length > 0
+    ? thinkingLevelMap
+    : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +922,9 @@ function streamCursorCli(
         });
       };
 
-      const rl = createInterface({ input: child.stdout!, crlfDelay: Infinity });
+      const stdout = child.stdout;
+      if (!stdout) throw new Error("Cursor CLI stdout pipe is unavailable");
+      const rl = createInterface({ input: stdout, crlfDelay: Infinity });
 
       rl.on("line", (line: string) => {
         const event = parseLine(line);
@@ -1108,19 +1145,21 @@ function toProviderModels(defs: CursorModelDef[]) {
     };
     contextWindow: number;
     maxTokens: number;
+    thinkingLevelMap?: { xhigh?: string; max?: string };
   }> = [];
 
   for (const [family, variants] of familyVariants) {
     if (seen.has(family)) continue;
     seen.add(family);
 
-    const defaultId = pickVariant(family);
+    const defaultId = pickVariant(family, undefined, true);
     const defaultDef = variants.find((v) => v.id === defaultId) ?? variants[0];
     const hasThinking = variants.some((v) => parseCursorModelId(v.id).thinking);
     const effortCount = new Set(
       variants.map((v) => parseCursorModelId(v.id).effort).filter(Boolean),
     ).size;
     const attrs = inferAttrs(defaultDef.id, defaultDef.name);
+    const thinkingLevelMap = thinkingLevelMapFor(variants);
 
     models.push({
       id: family,
@@ -1130,6 +1169,7 @@ function toProviderModels(defs: CursorModelDef[]) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: attrs.contextWindow,
       maxTokens: attrs.maxTokens,
+      ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
     });
   }
 
