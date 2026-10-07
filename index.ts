@@ -628,6 +628,12 @@ interface CursorSessionState {
   dirty: boolean;
 }
 
+function clearCursorSession(session: CursorSessionState): void {
+  session.chatId = undefined;
+  session.workspace = undefined;
+  session.dirty = true;
+}
+
 type CursorStreamEvent =
   | CursorAssistantEvent
   | CursorToolCallEvent
@@ -1180,11 +1186,38 @@ export default async function (pi: ExtensionAPI) {
   const agentPath =
     process.env["CURSOR_AGENT_PATH"] ?? process.env["AGENT_PATH"] ?? "agent";
   let permissionsPrompted = false;
-  const cursorSession: CursorSessionState = { dirty: false };
-  const resetCursorSession = () => {
-    cursorSession.chatId = undefined;
-    cursorSession.workspace = undefined;
-    cursorSession.dirty = true;
+  // Pi can run more than one AgentSession through the same provider
+  // registration. The main conversation and Firstmate's supervision branch
+  // therefore must not share the Cursor chat resumed by this state. Pi passes
+  // the owning session id through SimpleStreamOptions; keep one Cursor state
+  // per id and reserve the main state for the session lifecycle hooks below.
+  const branchSessions = new Map<string, CursorSessionState>();
+  let mainSessionId: string | undefined;
+  let mainSession: CursorSessionState = { dirty: false };
+
+  const sessionForRequest = (
+    options: SimpleStreamOptions | undefined,
+  ): CursorSessionState => {
+    const requestSessionId = options?.sessionId?.trim();
+    if (!requestSessionId) return mainSession;
+
+    // Current Pi versions use the session id directly. Some harness layers
+    // append their lane name; treating that as the same main session preserves
+    // main resume while still keeping any other AgentSession isolated.
+    if (
+      mainSessionId &&
+      (requestSessionId === mainSessionId ||
+        requestSessionId.startsWith(`${mainSessionId}:`))
+    ) {
+      return mainSession;
+    }
+
+    let session = branchSessions.get(requestSessionId);
+    if (!session) {
+      session = { dirty: false };
+      branchSessions.set(requestSessionId, session);
+    }
+    return session;
   };
 
   const promptPermissions = async (ctx: ExtensionContext) => {
@@ -1241,13 +1274,16 @@ export default async function (pi: ExtensionAPI) {
     api: "cursor-cli" as Api,
     models: toProviderModels(modelDefs),
     streamSimple: (model, context, options) =>
-      streamCursorCli(model, context, options, cursorSession),
+      streamCursorCli(model, context, options, sessionForRequest(options)),
   });
 
   pi.on("session_start", async (event, ctx) => {
-    cursorSession.chatId = undefined;
-    cursorSession.workspace = undefined;
-    cursorSession.dirty = false;
+    // A new main session also starts a new supervision branch. Drop all
+    // secondary states so a branch from a prior main session cannot survive a
+    // /new, /resume, /fork, reload, or process restart.
+    branchSessions.clear();
+    mainSessionId = ctx.sessionManager.getSessionId();
+    mainSession = { dirty: false };
     const reason = (event as { reason?: string }).reason;
     if (reason !== "new" && reason !== "fork") {
       for (const entry of ctx.sessionManager.getEntries()) {
@@ -1259,11 +1295,11 @@ export default async function (pi: ExtensionAPI) {
             typeof data?.chatId === "string" &&
             data.workspace === ctx.cwd
           ) {
-            cursorSession.chatId = data.chatId;
-            cursorSession.workspace = ctx.cwd;
+            mainSession.chatId = data.chatId;
+            mainSession.workspace = ctx.cwd;
           } else {
-            cursorSession.chatId = undefined;
-            cursorSession.workspace = undefined;
+            mainSession.chatId = undefined;
+            mainSession.workspace = undefined;
           }
         }
       }
@@ -1277,16 +1313,16 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", () => {
-    if (!cursorSession.dirty) return;
+    if (!mainSession.dirty) return;
     pi.appendEntry("cursor-session", {
-      chatId: cursorSession.chatId ?? null,
-      workspace: cursorSession.workspace ?? null,
+      chatId: mainSession.chatId ?? null,
+      workspace: mainSession.workspace ?? null,
     });
-    cursorSession.dirty = false;
+    mainSession.dirty = false;
   });
 
-  pi.on("session_compact", resetCursorSession);
-  pi.on("session_tree", resetCursorSession);
+  pi.on("session_compact", () => clearCursorSession(mainSession));
+  pi.on("session_tree", () => clearCursorSession(mainSession));
 
   pi.on("model_select", async (event, ctx) => {
     if (

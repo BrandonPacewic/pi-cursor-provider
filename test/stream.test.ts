@@ -17,14 +17,16 @@ import type {
 import extension from "../index.js";
 
 const cli = `#!/usr/bin/env node
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 if (process.argv.includes("models")) {
   console.log(process.env.TEST_MODELS ?? "auto - Auto");
 } else {
   let prompt = "";
   process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.on("end", () => {
-    writeFileSync(process.env.ARGS_FILE, JSON.stringify(process.argv.slice(2)));
+    const args = process.argv.slice(2);
+    writeFileSync(process.env.ARGS_FILE, JSON.stringify(args));
+    appendFileSync(process.env.CALLS_FILE, JSON.stringify({ args, prompt }) + "\\n");
     writeFileSync(process.env.PROMPT_FILE, prompt);
     const resumeFailed = process.env.TEST_RESUME_FAIL && process.argv.includes("--resume");
     if (process.env.TEST_MALFORMED) console.log("not-json");
@@ -38,6 +40,7 @@ if (process.argv.includes("models")) {
 type RequestOptions = {
   modelId?: string;
   reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  sessionId?: string;
 };
 
 type ProviderModelWithThinkingLevelMap = {
@@ -61,6 +64,7 @@ async function run(
   context: unknown = { messages: [] },
   nextContext?: unknown,
   request: RequestOptions = {},
+  nextRequest: RequestOptions = request,
 ) {
   const previousRun = pendingRun;
   let release: (() => void) | undefined;
@@ -70,7 +74,7 @@ async function run(
 
   await previousRun;
   try {
-    return await runUnsafe(flags, context, nextContext, request);
+    return await runUnsafe(flags, context, nextContext, request, nextRequest);
   } finally {
     release?.();
   }
@@ -81,17 +85,21 @@ async function runUnsafe(
   context: unknown = { messages: [] },
   nextContext?: unknown,
   request: RequestOptions = {},
+  nextRequest: RequestOptions = request,
 ) {
   const dir = await mkdtemp(join(tmpdir(), "pi-cursor-provider-test-"));
   const agentPath = join(dir, "agent.mjs");
   const argsPath = join(dir, "args.json");
+  const callsPath = join(dir, "calls.jsonl");
   const promptPath = join(dir, "prompt.txt");
   await writeFile(agentPath, cli);
   await chmod(agentPath, 0o755);
+  await writeFile(callsPath, "");
 
   const envKeys = [
     "CURSOR_AGENT_PATH",
     "ARGS_FILE",
+    "CALLS_FILE",
     "PROMPT_FILE",
     ...Object.keys(flags),
   ];
@@ -101,6 +109,7 @@ async function runUnsafe(
   Object.assign(process.env, {
     CURSOR_AGENT_PATH: agentPath,
     ARGS_FILE: argsPath,
+    CALLS_FILE: callsPath,
     PROMPT_FILE: promptPath,
     ...flags,
   });
@@ -122,12 +131,14 @@ async function runUnsafe(
     provider: "cursor",
     id: request.modelId ?? "auto",
   } as Parameters<typeof provider.streamSimple>[0];
-  const collect = async (value: unknown) => {
-    const streamOptions = request.reasoning
-      ? ({ reasoning: request.reasoning } as unknown as Parameters<
-          typeof streamSimple
-        >[2])
-      : undefined;
+  const collect = async (value: unknown, callRequest: RequestOptions) => {
+    const streamOptions =
+      callRequest.reasoning || callRequest.sessionId
+        ? ({
+            ...(callRequest.reasoning ? { reasoning: callRequest.reasoning } : {}),
+            ...(callRequest.sessionId ? { sessionId: callRequest.sessionId } : {}),
+          } as unknown as Parameters<typeof streamSimple>[2])
+        : undefined;
     const events = [];
     const stream = streamSimple(
       model,
@@ -137,11 +148,16 @@ async function runUnsafe(
     for await (const event of stream) events.push(event);
     return events;
   };
-  let events = await collect(context);
-  if (nextContext) events = await collect(nextContext);
+  let events = await collect(context, request);
+  if (nextContext) events = await collect(nextContext, nextRequest);
 
   const args = JSON.parse(await readFile(argsPath, "utf8"));
   const prompt = await readFile(promptPath, "utf8");
+  const calls = (await readFile(callsPath, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
   await rm(dir, { recursive: true, force: true });
   Object.assign(process.env, saved);
   for (const [key, value] of Object.entries(saved))
@@ -150,6 +166,7 @@ async function runUnsafe(
     args,
     events,
     prompt,
+    calls,
     models: (provider.models ?? []) as ProviderModelWithThinkingLevelMap[],
   };
 }
@@ -217,6 +234,24 @@ test("successful turns resume the Cursor chat with only the latest user message"
   );
   assert.deepEqual(args.slice(-2), ["--resume", "chat-1"]);
   assert.equal(prompt, "second");
+});
+
+test("main and supervision sessions keep separate Cursor chats", async () => {
+  const { calls } = await run(
+    { TEST_SUCCESS: "1" },
+    { messages: [{ role: "user", content: "main wake" }] },
+    {
+      messages: [
+        { role: "user", content: "supervision wake" },
+      ],
+    },
+    { sessionId: "main-session" },
+    { sessionId: "branch-session" },
+  );
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].args.includes("--resume"), false);
+  assert.equal(calls[1].args.includes("--resume"), false);
 });
 
 test("a failed resume retries once with the full Pi context", async () => {
